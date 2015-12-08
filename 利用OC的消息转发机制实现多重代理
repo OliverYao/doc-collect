@@ -1,0 +1,206 @@
+[Collect]利用OC的消息转发机制实现多重代理 http://www.cocoachina.com/ios/20151208/14595.html
+
+在Objective-C中，经常使用delegate来在对象之间通信，但是delegate一般是对象间一对一的通信，有时候我们希望delegate方法由多个不同的对象来处理，比如UITableView继承于UIScrollView,我们希望他的delegate中UIScrollViewDelegate的方法由一个独立的类来处理，以便实现一些效果，比如像下图这样的头部图片滚动拉伸效果，只需要实现UIScrolViewDelegate的scrollViewDidScroll方法，这样做的好处是可以降低代码耦合度，将实现不同功能的方法封装在独立的delegate中，便于复用和维护管理。
+blog_2_0.gif
+
+一、OC的消息机制
+
+那么，怎样实现delegate方法的动态转发呢？这需要用到Objective-C的消息机制，我们都知道，在OC中，调用一个对象的方法，实际上是给对象发了一条消息，在编译Objective－C函数调用的语法时，会被翻译成一个C的函数调用：objc_msgSend(),例如：
+
+
+[array insertObject:foo atIndex:2];
+//会被翻译成:
+objc_msgSend(array, @selector(insertObject:atIndex), foo, 2);
+那么，objc_msgSend又做了哪些事呢？，以[object foo]为例:
+
+通过object的isa指针找到它的class
+在class的method_list中找到foo
+如果class中没找到foo，则继续往他的superclass中查找
+一旦找到foo这个函数，就去执行对应的方法实现(IMP)
+如果一直没有找到foo,OC的runtime将继续下面的步骤：
+
+二、动态方法决议与消息转发
+
+在Objective-C中，如果向一个对象发送一条该对象无法处理的消息(对应selector不存在)，会导致程序crash， 但是，在crash之前，oc的运行时系统会先经过以下两个步骤：
+
+Dynamic Method Resolution
+Message Forwarding
+1、Dynamic Method Resolution（动态方法决议）
+
+首先，如果调用的方法是实例方法，OC的运行时会调用－ (BOOL)resolveInstanceMethod:(SEL)sel，如果是类方法，则会调用+ (BOOL)resolveClassMethod:(SEL)sel 让我们可以在程序运行时动态的为一个selector提供实现,如果我们添加了函数的实现，并返回YES，运行时系统会重启一次消息的发送过程，调用动态添加的方法。例如,下面的例子：
+
++ (BOOL)resolveInstanceMethod:(SEL)sel{
+    if (sel == @selector(foo)) {
+        class_addMethod([self class], sel, (IMP)dynamicMethodIMP, "V@:");
+        return YES;
+    }
+    return [super resolveInstanceMethod:sel];
+}
+void dynamicMethodIMP(id self, SEL _cmd){
+    NSLog(@"%s", __PRETTY_FUNCTION__);
+}
+class_addMethod 方法动态的添加新的方法与对应的实现，如果调用了[Foo foo],将会转到动态添加的dynamicMethodIMP 方法中。Objective-C的方法本质上是一个至少包含两个参数(id self, SEL _cmd)的C函数，这样，当重启消息发送时，就能在类中找到@selector(foo)了。而如果方法返回NO时，将会进入下一步：消息转发(Message Forwarding)
+
+2、Message Forwarding（消息转发）
+
+消息转发分为两步：
+
+首先运行时系统会调用- (id)forwardingTargetForSelector:(SEL)aSelector方法，如果这个方法中返回的不是nil或者self，运行时系统将把消息发送给返回的那个对象
+如果- (id)forwardingTargetForSelector:(SEL)aSelector返回的是nil或者self，运行时系统首先会调用- (NSMethodSignature *)methodSignatureForSelector:(SEL)aSelector方法来获得方法签名，方法签名记录了方法的参数和返回值的信息，如果－methodSignatureForSelector 返回的是nil, 运行时系统会抛出unrecognized selector exception，程序到这里就结束了。
+整个流程可以用下面这张图表示
+http://cc.cocimg.com/api/uploads/20151207/1449456989807643.png
+blog_2_1.png
+
+三、实现多重代理
+
+结合上面的流程分析，我么可以发现，要实现多重代理的分发，我们需要让Runtime系统运行到forwardInvocation这一步，并在该方法中将delegate方法分发到其他各个对象中去：
+
+- (NSMethodSignature *)methodSignatureForSelector:(SEL)aSelector{
+    NSMethodSignature *signature = [super methodSignatureForSelector:aSelector];
+    if (!signature) {
+        for (id target in self.allDelegates) {
+            if ((signature = [target methodSignatureForSelector:aSelector])) {
+                break;
+            }
+        }
+    }
+    return signature;
+}
+ 
+- (void)forwardInvocation:(NSInvocation *)anInvocation{
+    for (id target in self.allDelegates) {
+        if ([target respondsToSelector:anInvocation.selector]) {
+            [anInvocation invokeWithTarget:target];
+        }
+    }
+}
+由于我们调用delegate的方法时，一般会先调用[delegate responseToSelector]方法，所以，我们还需要实现这个方法：
+
+- (BOOL)respondsToSelector:(SEL)aSelector{
+    if ([super respondsToSelector:aSelector]) {
+        return YES;
+    }
+     
+    for (id target in self.allDelegates) {
+        if ([target respondsToSelector:aSelector]) {
+            return YES;
+        }
+    }
+     
+    return NO;
+}  
+ 
+@end
+然后我们来测试一下，新建一个ScrollDelegate类，实现UIScrollViewDelegate方法：
+
+
+#import "ScrollDelegate.h"
+ 
+@implementation ScrollDelegate
+ 
+- (void)scrollViewDidScroll:(UIScrollView *)scrollView{
+    NSLog(@"%s", __PRETTY_FUNCTION__);
+}
+ 
+@end
+然后再新建一个ViewController，也实现UIScrollViewDelegate方法，添加一个UIScrollView在controller的view中，然后设置scrollView的delegate为multipleProxy：
+
+
+#import "ViewController.h"
+#import "MultipleDelegate.h"
+#import "ScrollDelegate.h"
+ 
+@interface ViewController ()@property (weak, nonatomic) IBOutlet UIScrollView *scrollView;
+ 
+@end
+ 
+@implementation ViewController{
+    MultipleDelegate *_multipleDelegate;
+}
+ 
+- (void)viewDidLoad {
+    [super viewDidLoad];
+     
+    self.scrollView.contentSize = CGSizeMake(self.view.bounds.size.width, self.view.bounds.size.height * 2);
+     
+    _multipleDelegate = [MultipleDelegate new];
+    //添加要处理delegate方法的对象
+    NSArray *array = @[self, [ScrollDelegate new]];
+    _multipleDelegate.allDelegates = array;
+     
+    self.scrollView.delegate = (id)_multipleDelegate;
+}
+ 
+- (void)scrollViewDidScroll:(UIScrollView *)scrollView{
+    NSLog(@"%s", __PRETTY_FUNCTION__);
+}
+ 
+@end
+运行，滑动scrollView，看看控制台打印的信息：
+
+
+2015-11-01 11:07:49.199 MultipleDelegateDemo[4732:498520] -[ViewController scrollViewDidScroll:]
+2015-11-01 11:07:49.200 MultipleDelegateDemo[4732:498520] -[ScrollDelegate scrollViewDidScroll:]
+2015-11-01 11:07:49.227 MultipleDelegateDemo[4732:498520] -[ViewController scrollViewDidScroll:]
+2015-11-01 11:07:49.227 MultipleDelegateDemo[4732:498520] -[ScrollDelegate scrollViewDidScroll:]
+很好，deegate方法已经被正确地转发给了两个对象了，看起来好像没什么不对，可是，细心的你一定会发现，这里存在retain cycle：controller -> _multipleDelegate -> controller，那么怎样解决这个问题呢？
+
+四、NSPointerArray防止循环引用
+
+因为NSArray会对对象进行retain操作，导致循环引用的产生，所以我们可以用NSPointerArray来解决这个问题，但是需要注意对于其他的delegate对象也需要在controller中对其强引用， 最终MultipleDelegateProxy的实现：
+
+
+#import "KIZMultipleDelegateProxy.h"
+ 
+@interface KIZMultipleDelegateProxy ()
+ 
+@property (nonatomic, strong) NSPointerArray *weakRefTargets;
+ 
+@end
+ 
+@implementation KIZMultipleDelegateProxy
+- (void)setDelegateTargets:(NSArray *)delegateTargets{
+    self.weakRefTargets = [NSPointerArray weakObjectsPointerArray];
+    for (id delegate in delegateTargets) {
+        [self.weakRefTargets addPointer:(__bridge void *)delegate];
+    }
+}
+ 
+- (BOOL)respondsToSelector:(SEL)aSelector{
+    if ([super respondsToSelector:aSelector]) {
+        return YES;
+    }
+    for (id target in self.weakRefTargets) {
+        if ([target respondsToSelector:aSelector]) {
+            return YES;
+        }
+    }
+     
+    return NO;
+}
+ 
+- (NSMethodSignature *)methodSignatureForSelector:(SEL)aSelector{
+    NSMethodSignature *sig = [super methodSignatureForSelector:aSelector];
+    if (!sig) {
+        for (id target in self.weakRefTargets) {
+            if ((sig = [target methodSignatureForSelector:aSelector])) {
+                break;
+            }
+        }
+    }
+     
+    return sig;
+}
+ 
+//转发方法调用给所有delegate
+- (void)forwardInvocation:(NSInvocation *)anInvocation{
+    for (id target in self.weakRefTargets) {
+        if ([target respondsToSelector:anInvocation.selector]) {
+            [anInvocation invokeWithTarget:target];
+        }
+    }
+}
+@end
+五、小记
+
+利用这个多重代理动态转发，我封装了一些独立的delegate实现的小功能，比如本文开头提到的TableView头部图片拉伸效果，放在github上：https://github.com/zziking/KIZBehavior
